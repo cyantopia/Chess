@@ -29,6 +29,7 @@ import {
 
 const ROOM_SESSION_KEY = "ryan-chess-room-session";
 const ROOM_MATCH_STATE_PREFIX = "ryan-chess-room-match";
+const ROOM_PLAYER_NAME_KEY = "ryan-chess-player-name";
 const ROOM_POLL_INTERVAL_MS = 1200;
 const RTC_CONFIGURATION: RTCConfiguration = {
   iceServers: [
@@ -802,25 +803,55 @@ export function RoomArena() {
     setIsHydrated(true);
     ensureInstanceId();
 
+    const storedPlayerName = window.localStorage.getItem(ROOM_PLAYER_NAME_KEY);
+    const normalizedStoredPlayerName = trimName(storedPlayerName ?? "");
+
+    if (normalizedStoredPlayerName) {
+      setPlayerName(normalizedStoredPlayerName);
+    }
+
     const storedSession = window.sessionStorage.getItem(ROOM_SESSION_KEY);
-    const inviteCode = new URLSearchParams(window.location.search).get("room");
+    const inviteCode =
+      new URLSearchParams(window.location.search).get("room")?.trim().toUpperCase() ??
+      "";
 
     if (!storedSession) {
       if (inviteCode) {
-        setJoinCode(inviteCode.trim().toUpperCase());
+        setJoinCode(inviteCode);
       }
 
       return;
     }
 
     try {
-      setSession(JSON.parse(storedSession) as RoomSession);
+      const parsedSession = JSON.parse(storedSession) as RoomSession;
+
+      if (parsedSession.playerName) {
+        setPlayerName(trimName(parsedSession.playerName));
+      }
+
+      if (inviteCode && parsedSession.roomCode !== inviteCode) {
+        window.sessionStorage.removeItem(ROOM_SESSION_KEY);
+        window.sessionStorage.removeItem(getMatchStorageKey(parsedSession));
+        setJoinCode(inviteCode);
+
+        void fetch(
+          `/api/rooms/${parsedSession.roomCode}?playerId=${parsedSession.playerId}`,
+          {
+            method: "DELETE",
+          },
+        ).catch(() => null);
+
+        return;
+      }
+
+      setSession(parsedSession);
     } catch {
       window.sessionStorage.removeItem(ROOM_SESSION_KEY);
     }
 
     if (inviteCode) {
-      setJoinCode(inviteCode.trim().toUpperCase());
+      setJoinCode(inviteCode);
     }
   }, []);
 
@@ -881,6 +912,21 @@ export function RoomArena() {
       JSON.stringify(match),
     );
   }, [isHydrated, match, session]);
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return;
+    }
+
+    const normalizedPlayerName = trimName(playerName);
+
+    if (!normalizedPlayerName) {
+      window.localStorage.removeItem(ROOM_PLAYER_NAME_KEY);
+      return;
+    }
+
+    window.localStorage.setItem(ROOM_PLAYER_NAME_KEY, normalizedPlayerName);
+  }, [isHydrated, playerName]);
 
   useEffect(() => {
     return () => {
