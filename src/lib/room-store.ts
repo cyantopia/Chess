@@ -319,6 +319,7 @@ export async function postRoomSignal(input: {
   code: string;
   playerId: string;
   targetId: string;
+  connectionId: string;
   targetInstanceId?: string | null;
   signal:
     | {
@@ -344,6 +345,7 @@ export async function postRoomSignal(input: {
 
   const baseSignal = {
     id: crypto.randomUUID(),
+    connectionId: input.connectionId,
     senderId: sender.id,
     senderInstanceId: sender.instanceId,
     targetId: target.id,

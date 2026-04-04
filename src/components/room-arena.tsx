@@ -31,6 +31,7 @@ const ROOM_SESSION_KEY = "ryan-chess-room-session";
 const ROOM_MATCH_STATE_PREFIX = "ryan-chess-room-match";
 const ROOM_PLAYER_NAME_KEY = "ryan-chess-player-name";
 const ROOM_POLL_INTERVAL_MS = 1200;
+const DISCONNECT_RECOVERY_MS = 3200;
 const RTC_CONFIGURATION: RTCConfiguration = {
   iceServers: [
     {
@@ -46,6 +47,11 @@ type ConnectionStatus =
   | "negotiating"
   | "connected"
   | "disconnected";
+
+type PendingCandidate = {
+  connectionId: string;
+  candidate: RTCIceCandidateInit;
+};
 
 function getMatchStorageKey(session: RoomSession) {
   return `${ROOM_MATCH_STATE_PREFIX}:${session.roomCode}:${session.playerId}`;
@@ -219,14 +225,16 @@ export function RoomArena() {
 
   const syncingRef = useRef(false);
   const copyResetTimerRef = useRef<number | null>(null);
+  const disconnectRetryTimerRef = useRef<number | null>(null);
   const instanceIdRef = useRef("");
   const roomRef = useRef<RoomSnapshot | null>(null);
   const matchRef = useRef(match);
   const connectionStatusRef = useRef<ConnectionStatus>("idle");
   const offeredForInstanceRef = useRef("");
+  const activeConnectionIdRef = useRef("");
   const remoteInstanceRef = useRef("");
   const processedSignalIdsRef = useRef<Set<string>>(new Set());
-  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const pendingIceCandidatesRef = useRef<PendingCandidate[]>([]);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
 
@@ -264,6 +272,15 @@ export function RoomArena() {
     startTransition(() => {
       setConnectionStatus(nextStatus);
     });
+  };
+
+  const clearDisconnectRetryTimer = () => {
+    if (!disconnectRetryTimerRef.current) {
+      return;
+    }
+
+    window.clearTimeout(disconnectRetryTimerRef.current);
+    disconnectRetryTimerRef.current = null;
   };
 
   const commitMatchState = (nextMatch: MatchState) => {
@@ -318,12 +335,14 @@ export function RoomArena() {
     async (
       signal:
         | {
+            connectionId: string;
             kind: "offer" | "answer";
             targetId: string;
             targetInstanceId?: string | null;
             description: RTCSessionDescriptionInit;
           }
         | {
+            connectionId: string;
             kind: "ice";
             targetId: string;
             targetInstanceId?: string | null;
@@ -343,6 +362,7 @@ export function RoomArena() {
           body: JSON.stringify({
             playerId: session.playerId,
             targetId: signal.targetId,
+            connectionId: signal.connectionId,
             targetInstanceId: signal.targetInstanceId ?? null,
             kind: signal.kind,
             description: "description" in signal ? signal.description : undefined,
@@ -375,24 +395,31 @@ export function RoomArena() {
     },
   );
 
-  const flushPendingIceCandidates = useEffectEvent(async () => {
-    const peerConnection = peerConnectionRef.current;
+  const flushPendingIceCandidates = useEffectEvent(
+    async (connectionId = activeConnectionIdRef.current) => {
+      const peerConnection = peerConnectionRef.current;
 
-    if (!peerConnection || !peerConnection.remoteDescription) {
-      return;
-    }
-
-    const candidates = [...pendingIceCandidatesRef.current];
-    pendingIceCandidatesRef.current = [];
-
-    for (const candidate of candidates) {
-      try {
-        await peerConnection.addIceCandidate(candidate);
-      } catch {
-        pendingIceCandidatesRef.current.push(candidate);
+      if (!peerConnection || !peerConnection.remoteDescription || !connectionId) {
+        return;
       }
-    }
-  });
+
+      const candidates = pendingIceCandidatesRef.current.filter((entry) => {
+        return entry.connectionId === connectionId;
+      });
+
+      pendingIceCandidatesRef.current = pendingIceCandidatesRef.current.filter(
+        (entry) => entry.connectionId !== connectionId,
+      );
+
+      for (const entry of candidates) {
+        try {
+          await peerConnection.addIceCandidate(entry.candidate);
+        } catch {
+          pendingIceCandidatesRef.current.push(entry);
+        }
+      }
+    },
+  );
 
   const applyRemoteMatch = useEffectEvent((nextMatch: MatchState) => {
     const normalizedMatch = withDerivedMatchStatus(nextMatch, roomRef.current);
@@ -405,6 +432,7 @@ export function RoomArena() {
   });
 
   const resetPeerConnection = (nextStatus: ConnectionStatus = "negotiating") => {
+    clearDisconnectRetryTimer();
     const channel = dataChannelRef.current;
 
     if (channel) {
@@ -435,6 +463,7 @@ export function RoomArena() {
 
     pendingIceCandidatesRef.current = [];
     offeredForInstanceRef.current = "";
+    activeConnectionIdRef.current = "";
 
     if (!roomRef.current || roomRef.current.players.length < 2) {
       setLiveConnectionStatus("waiting-peer");
@@ -442,6 +471,28 @@ export function RoomArena() {
     }
 
     setLiveConnectionStatus(nextStatus);
+  };
+
+  const markDisconnected = () => {
+    setLiveConnectionStatus("disconnected");
+
+    if (disconnectRetryTimerRef.current || !roomRef.current) {
+      return;
+    }
+
+    disconnectRetryTimerRef.current = window.setTimeout(() => {
+      disconnectRetryTimerRef.current = null;
+
+      if (
+        connectionStatusRef.current === "connected" ||
+        !roomRef.current ||
+        roomRef.current.players.length < 2
+      ) {
+        return;
+      }
+
+      resetPeerConnection("negotiating");
+    }, DISCONNECT_RECOVERY_MS);
   };
 
   const handlePeerMessage = useEffectEvent((event: MessageEvent<string>) => {
@@ -462,6 +513,7 @@ export function RoomArena() {
     dataChannelRef.current = channel;
 
     channel.onopen = () => {
+      clearDisconnectRetryTimer();
       setLiveConnectionStatus("connected");
       offeredForInstanceRef.current = remoteInstanceRef.current;
 
@@ -476,30 +528,34 @@ export function RoomArena() {
 
     channel.onclose = () => {
       dataChannelRef.current = null;
-
-      if (roomRef.current?.players.length === 2) {
-        setLiveConnectionStatus("disconnected");
-      } else {
-        setLiveConnectionStatus("waiting-peer");
-      }
+      markDisconnected();
     };
 
     channel.onerror = () => {
-      setLiveConnectionStatus("disconnected");
+      markDisconnected();
     };
   });
 
   const createPeerConnection = useEffectEvent(
-    (remotePlayer: RoomPlayer, shouldCreateDataChannel: boolean) => {
+    (
+      remotePlayer: RoomPlayer,
+      shouldCreateDataChannel: boolean,
+      connectionId: string,
+    ) => {
       const peerConnection = new RTCPeerConnection(RTC_CONFIGURATION);
       peerConnectionRef.current = peerConnection;
 
       peerConnection.onicecandidate = (event) => {
-        if (!event.candidate) {
+        if (
+          !event.candidate ||
+          activeConnectionIdRef.current !== connectionId ||
+          peerConnectionRef.current !== peerConnection
+        ) {
           return;
         }
 
         void postSignal({
+          connectionId,
           kind: "ice",
           targetId: remotePlayer.id,
           targetInstanceId: remotePlayer.instanceId ?? null,
@@ -508,7 +564,12 @@ export function RoomArena() {
       };
 
       peerConnection.onconnectionstatechange = () => {
+        if (peerConnectionRef.current !== peerConnection) {
+          return;
+        }
+
         if (peerConnection.connectionState === "connected") {
+          clearDisconnectRetryTimer();
           setLiveConnectionStatus("connected");
           return;
         }
@@ -517,24 +578,41 @@ export function RoomArena() {
           peerConnection.connectionState === "connecting" ||
           peerConnection.connectionState === "new"
         ) {
+          clearDisconnectRetryTimer();
           setLiveConnectionStatus("negotiating");
           return;
         }
 
-        if (
-          peerConnection.connectionState === "disconnected" ||
-          peerConnection.connectionState === "failed"
-        ) {
+        if (peerConnection.connectionState === "disconnected") {
+          markDisconnected();
+          return;
+        }
+
+        if (peerConnection.connectionState === "failed") {
           resetPeerConnection("disconnected");
         }
       };
 
       peerConnection.oniceconnectionstatechange = () => {
-        if (
-          peerConnection.iceConnectionState === "failed" ||
-          peerConnection.iceConnectionState === "disconnected"
-        ) {
+        if (peerConnectionRef.current !== peerConnection) {
+          return;
+        }
+
+        if (peerConnection.iceConnectionState === "failed") {
           resetPeerConnection("disconnected");
+          return;
+        }
+
+        if (peerConnection.iceConnectionState === "disconnected") {
+          markDisconnected();
+          return;
+        }
+
+        if (
+          peerConnection.iceConnectionState === "connected" ||
+          peerConnection.iceConnectionState === "completed"
+        ) {
+          clearDisconnectRetryTimer();
         }
       };
 
@@ -590,10 +668,12 @@ export function RoomArena() {
     }
 
     resetPeerConnection("negotiating");
+    const connectionId = crypto.randomUUID();
+    activeConnectionIdRef.current = connectionId;
     remoteInstanceRef.current = remotePlayer.instanceId;
 
     try {
-      const peerConnection = createPeerConnection(remotePlayer, true);
+      const peerConnection = createPeerConnection(remotePlayer, true, connectionId);
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
       const description = serializeDescription(
@@ -605,6 +685,7 @@ export function RoomArena() {
       }
 
       const sent = await postSignal({
+        connectionId,
         kind: "offer",
         targetId: remotePlayer.id,
         targetInstanceId: remotePlayer.instanceId,
@@ -667,10 +748,15 @@ export function RoomArena() {
         if (signal.kind === "offer") {
           try {
             resetPeerConnection("negotiating");
+            activeConnectionIdRef.current = signal.connectionId;
 
-            const peerConnection = createPeerConnection(remotePlayer, false);
+            const peerConnection = createPeerConnection(
+              remotePlayer,
+              false,
+              signal.connectionId,
+            );
             await peerConnection.setRemoteDescription(signal.description);
-            await flushPendingIceCandidates();
+            await flushPendingIceCandidates(signal.connectionId);
 
             const answer = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answer);
@@ -683,6 +769,7 @@ export function RoomArena() {
             }
 
             await postSignal({
+              connectionId: signal.connectionId,
               kind: "answer",
               targetId: signal.senderId,
               targetInstanceId: signal.senderInstanceId,
@@ -699,6 +786,10 @@ export function RoomArena() {
 
         if (signal.kind === "answer") {
           try {
+            if (signal.connectionId !== activeConnectionIdRef.current) {
+              continue;
+            }
+
             const peerConnection = peerConnectionRef.current;
 
             if (!peerConnection || !peerConnection.localDescription) {
@@ -706,7 +797,7 @@ export function RoomArena() {
             }
 
             await peerConnection.setRemoteDescription(signal.description);
-            await flushPendingIceCandidates();
+            await flushPendingIceCandidates(signal.connectionId);
             setLiveConnectionStatus("negotiating");
           } catch {
             resetPeerConnection("disconnected");
@@ -716,17 +807,31 @@ export function RoomArena() {
         }
 
         if (signal.kind === "ice") {
+          if (signal.connectionId !== activeConnectionIdRef.current) {
+            pendingIceCandidatesRef.current.push({
+              connectionId: signal.connectionId,
+              candidate: signal.candidate,
+            });
+            continue;
+          }
+
           const peerConnection = peerConnectionRef.current;
 
           if (!peerConnection || !peerConnection.remoteDescription) {
-            pendingIceCandidatesRef.current.push(signal.candidate);
+            pendingIceCandidatesRef.current.push({
+              connectionId: signal.connectionId,
+              candidate: signal.candidate,
+            });
             continue;
           }
 
           try {
             await peerConnection.addIceCandidate(signal.candidate);
           } catch {
-            pendingIceCandidatesRef.current.push(signal.candidate);
+            pendingIceCandidatesRef.current.push({
+              connectionId: signal.connectionId,
+              candidate: signal.candidate,
+            });
           }
         }
       }
@@ -934,6 +1039,11 @@ export function RoomArena() {
         window.clearTimeout(copyResetTimerRef.current);
       }
 
+      if (disconnectRetryTimerRef.current) {
+        window.clearTimeout(disconnectRetryTimerRef.current);
+        disconnectRetryTimerRef.current = null;
+      }
+
       const channel = dataChannelRef.current;
 
       if (channel) {
@@ -1030,6 +1140,7 @@ export function RoomArena() {
       processedSignalIdsRef.current.clear();
       offeredForInstanceRef.current = "";
       remoteInstanceRef.current = "";
+      activeConnectionIdRef.current = "";
       pendingIceCandidatesRef.current = [];
       resetPeerConnection("waiting-peer");
       commitRoomSnapshot(nextRoom);
@@ -1099,6 +1210,8 @@ export function RoomArena() {
 
       processedSignalIdsRef.current.clear();
       offeredForInstanceRef.current = "";
+      remoteInstanceRef.current = "";
+      activeConnectionIdRef.current = "";
       pendingIceCandidatesRef.current = [];
       resetPeerConnection("negotiating");
       commitRoomSnapshot(nextRoom);
@@ -1126,6 +1239,7 @@ export function RoomArena() {
     processedSignalIdsRef.current.clear();
     remoteInstanceRef.current = "";
     offeredForInstanceRef.current = "";
+    activeConnectionIdRef.current = "";
     resetPeerConnection("idle");
     commitRoomSnapshot(null);
     setLiveConnectionStatus("idle");

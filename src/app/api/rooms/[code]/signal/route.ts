@@ -16,13 +16,17 @@ export async function POST(
     typeof payload?.playerId === "string" ? payload.playerId.trim() : "";
   const targetId =
     typeof payload?.targetId === "string" ? payload.targetId.trim() : "";
+  const connectionId =
+    typeof payload?.connectionId === "string"
+      ? payload.connectionId.trim()
+      : "";
   const targetInstanceId =
     typeof payload?.targetInstanceId === "string"
       ? payload.targetInstanceId.trim()
       : null;
   const kind = typeof payload?.kind === "string" ? payload.kind.trim() : "";
 
-  if (!playerId || !targetId) {
+  if (!playerId || !targetId || !connectionId) {
     return NextResponse.json(
       { error: "신호를 보낼 플레이어 정보가 올바르지 않습니다." },
       { status: 400 },
@@ -47,6 +51,7 @@ export async function POST(
           code,
           playerId,
           targetId,
+          connectionId,
           targetInstanceId,
           signal: {
             kind,
@@ -79,6 +84,7 @@ export async function POST(
           code,
           playerId,
           targetId,
+          connectionId,
           targetInstanceId,
           signal: {
             kind: "ice",

@@ -60,6 +60,7 @@ export type RoomSnapshot = {
 export type RoomSignal =
   | {
       id: string;
+      connectionId: string;
       kind: "offer" | "answer";
       senderId: string;
       senderInstanceId: string | null;
@@ -70,6 +71,7 @@ export type RoomSignal =
     }
   | {
       id: string;
+      connectionId: string;
       kind: "ice";
       senderId: string;
       senderInstanceId: string | null;
