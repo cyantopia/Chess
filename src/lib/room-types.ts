@@ -81,9 +81,28 @@ export type RoomSignal =
       candidate: RTCIceCandidateInit;
     };
 
+export type RoomClientSignal =
+  | {
+      connectionId: string;
+      kind: "offer" | "answer";
+      description: RTCSessionDescriptionInit;
+    }
+  | {
+      connectionId: string;
+      kind: "ice";
+      candidate: RTCIceCandidateInit;
+    };
+
+export type PeerMoveRequest = {
+  from: Square;
+  to: Square;
+  promotion: "q" | "r" | "b" | "n";
+};
+
 export type RoomSync = {
   room: RoomSnapshot;
   signals: RoomSignal[];
+  messages: RoomRelayMessage[];
 };
 
 export type RoomSession = {
@@ -92,10 +111,26 @@ export type RoomSession = {
   playerName: string;
 };
 
-export type PeerMessage = {
-  kind: "sync" | "move";
-  match: MatchState;
-  sentAt: string;
+export type PeerMessage =
+  | {
+      kind: "match-sync";
+      match: MatchState;
+      sentAt: string;
+    }
+  | {
+      kind: "move-request";
+      move: PeerMoveRequest;
+      sentAt: string;
+    };
+
+export type RoomRelayMessage = {
+  id: string;
+  senderId: string;
+  senderInstanceId: string | null;
+  targetId: string;
+  targetInstanceId: string | null;
+  createdAt: string;
+  message: PeerMessage;
 };
 
 export function createInitialMatchState(

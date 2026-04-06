@@ -29,7 +29,8 @@ export default function AboutPage() {
                 Stockfish
               </span>
               엔진과 대전하거나, 방 코드를 만들어 친구와 같은 대국판에서
-              WebRTC 직접 연결로 플레이할 수 있도록 구성했습니다.
+              WebRTC 직접 연결을 우선 시도하고, 필요하면 Vercel relay로
+              이어서 플레이할 수 있도록 구성했습니다.
             </p>
           </div>
         </div>
@@ -86,7 +87,8 @@ export default function AboutPage() {
               AI 모드에서는 난이도를 조절하며 Stockfish와 바로 대국할 수 있습니다.
             </div>
             <div className="rounded-3xl border border-white/10 bg-black/14 p-4 text-stone-200">
-              방 모드에서는 코드를 생성하고 상대를 초대해 브라우저끼리 직접 대국 상태를 공유합니다.
+              방 모드에서는 코드를 생성하고 상대를 초대해 호스트 브라우저가
+              대국 상태를 관리하며, 직접 연결 또는 Vercel relay로 상태를 공유합니다.
             </div>
             <div className="rounded-3xl border border-white/10 bg-black/14 p-4 text-stone-200">
               기보, 마지막 수 하이라이트, 턴 상태를 한 화면에서 볼 수 있습니다.
@@ -103,10 +105,13 @@ export default function AboutPage() {
           </h2>
           <div className="mt-6 grid gap-3">
             <div className="rounded-3xl border border-white/10 bg-black/14 p-4 text-stone-200">
-              현재 방 기능은 Vercel을 signaling 용도로만 쓰고, 실제 수순은 WebRTC DataChannel로 두 클라이언트가 직접 교환합니다.
+              현재 방 기능은 WebRTC DataChannel을 우선 사용하고, 직접 연결이
+              어렵더라도 같은 메시지를 Vercel relay polling으로 전달해 대국을
+              이어갈 수 있습니다.
             </div>
             <div className="rounded-3xl border border-white/10 bg-black/14 p-4 text-stone-200">
-              일부 제한적인 네트워크 환경에서는 TURN 서버가 없으면 연결이 성립하지 않을 수 있어, 더 넓은 호환성을 원하면 TURN 또는 별도 realtime 인프라를 붙이는 것이 좋습니다.
+              TURN 없이도 플레이는 가능하지만, relay보다 직접 연결 성공률을
+              높이고 싶다면 나중에 TURN을 추가하는 편이 좋습니다.
             </div>
             <div className="rounded-3xl border border-white/10 bg-black/14 p-4 text-stone-200">
               다음 단계로는 실시간 소켓 동기화, 로그인, 대국 기록 저장을 붙이기 좋습니다.

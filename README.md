@@ -1,34 +1,71 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ryan Chess
 
-## Getting Started
+Next.js 기반 체스 서비스입니다.
 
-First, run the development server:
+- `AI 대전`: 브라우저 안에서 돌아가는 Stockfish
+- `방 대전`: WebRTC direct 우선, Vercel relay fallback
+- `backend`: Vercel Route Handler only
+
+## 실행
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+브라우저에서 `http://localhost:3000`을 열면 됩니다.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 멀티플레이 구조
 
-## Learn More
+현재 방 대전은 다음처럼 동작합니다.
 
-To learn more about Next.js, take a look at the following resources:
+- 방 메타데이터는 서버에 저장
+- 플레이어 presence는 플레이어별 heartbeat로 갱신
+- signaling 메시지는 플레이어별 inbox에 저장
+- relay 메시지는 플레이어별 inbox에 저장
+- 호스트(백)가 대국 상태를 authoritative 하게 관리
+- WebRTC direct가 열리면 브라우저끼리 직접 교환
+- 직접 연결이 안 되면 같은 메시지를 Vercel relay polling으로 전달
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## TURN 설정
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+이 프로젝트는 TURN 없이도 `Vercel-only`로 플레이할 수 있게 설계되어 있습니다. 다만 STUN만으로는 일부 네트워크 환경에서 direct 연결이 실패할 수 있어서, direct 성공률을 높이고 싶다면 TURN을 추가할 수 있습니다.
 
-## Deploy on Vercel
+`.env.local` 또는 Vercel Environment Variables에 아래 값을 넣을 수 있습니다.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+NEXT_PUBLIC_WEBRTC_STUN_URLS=stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
+NEXT_PUBLIC_WEBRTC_TURN_URLS=turn:your-turn-server.example.com:3478?transport=udp,turn:your-turn-server.example.com:3478?transport=tcp
+NEXT_PUBLIC_WEBRTC_TURN_USERNAME=your-username
+NEXT_PUBLIC_WEBRTC_TURN_CREDENTIAL=your-password
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+설명:
+
+- `NEXT_PUBLIC_WEBRTC_STUN_URLS`: 쉼표로 구분한 STUN URL 목록
+- `NEXT_PUBLIC_WEBRTC_TURN_URLS`: 쉼표로 구분한 TURN/TURNS URL 목록
+- `NEXT_PUBLIC_WEBRTC_TURN_USERNAME`: TURN 사용자명
+- `NEXT_PUBLIC_WEBRTC_TURN_CREDENTIAL`: TURN 비밀번호 또는 credential
+
+TURN 값이 비어 있어도 앱은 계속 동작하며, direct 연결이 안 잡히면 자동으로 `Vercel relay fallback`으로 진행합니다.
+
+## 디버깅
+
+방 화면 오른쪽에 `Browser Events` 패널이 있습니다. 여기서 아래 흐름을 확인할 수 있습니다.
+
+- `Offer start`
+- `Signal sent`
+- `Signal received`
+- `ICE gathering`
+- `ICE connection`
+- `Peer connection`
+- `Data channel open`
+
+여기서 `offer/answer`는 오가는데 `ICE connection`이 계속 `disconnected` 또는 `failed`로 끝나도, `Relay sent/Relay received`가 보이면 Vercel relay로 계속 대국할 수 있습니다.
+
+## 검증
+
+```bash
+pnpm lint
+pnpm build
+```

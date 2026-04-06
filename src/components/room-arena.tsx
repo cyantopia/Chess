@@ -4,7 +4,6 @@ import { Chess, type Square } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import {
   startTransition,
-  useDeferredValue,
   useEffect,
   useEffectEvent,
   useRef,
@@ -16,10 +15,13 @@ import {
   getRoomResult,
   serializeMove,
   sideLabel,
+  type PeerMoveRequest,
   toChessColor,
   toRoomColor,
   type MatchState,
   type PeerMessage,
+  type RoomClientSignal,
+  type RoomRelayMessage,
   type RoomPlayer,
   type RoomSession,
   type RoomSignal,
@@ -30,15 +32,13 @@ import {
 const ROOM_SESSION_KEY = "ryan-chess-room-session";
 const ROOM_MATCH_STATE_PREFIX = "ryan-chess-room-match";
 const ROOM_PLAYER_NAME_KEY = "ryan-chess-player-name";
+const ROOM_INSTANCE_ID_KEY = "ryan-chess-room-instance-id";
 const ROOM_POLL_INTERVAL_MS = 1200;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 const DISCONNECT_RECOVERY_MS = 3200;
-const RTC_CONFIGURATION: RTCConfiguration = {
-  iceServers: [
-    {
-      urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"],
-    },
-  ],
-};
+const SIGNAL_FLUSH_DELAY_MS = 140;
+const MAX_OUTGOING_SIGNAL_BUFFER = 80;
+const MAX_EVENT_LOGS = 72;
 
 type BusyMode = "create" | "join" | null;
 type ConnectionStatus =
@@ -47,11 +47,66 @@ type ConnectionStatus =
   | "negotiating"
   | "connected"
   | "disconnected";
+type TransportMode = "none" | "relay" | "webrtc";
 
 type PendingCandidate = {
   connectionId: string;
   candidate: RTCIceCandidateInit;
 };
+
+type RoomEventEntry = {
+  id: string;
+  at: string;
+  label: string;
+  detail: string;
+  level: "info" | "warn" | "error";
+};
+
+function parseIceServerUrls(
+  value: string | undefined,
+  fallback: string[] = [],
+) {
+  const urls = (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  return urls.length > 0 ? urls : fallback;
+}
+
+function createRtcConfiguration(): RTCConfiguration {
+  const stunUrls = parseIceServerUrls(process.env.NEXT_PUBLIC_WEBRTC_STUN_URLS, [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+  ]);
+  const turnUrls = parseIceServerUrls(process.env.NEXT_PUBLIC_WEBRTC_TURN_URLS);
+  const turnUsername = process.env.NEXT_PUBLIC_WEBRTC_TURN_USERNAME?.trim();
+  const turnCredential = process.env.NEXT_PUBLIC_WEBRTC_TURN_CREDENTIAL?.trim();
+  const iceServers: RTCIceServer[] = [];
+
+  if (stunUrls.length > 0) {
+    iceServers.push({ urls: stunUrls });
+  }
+
+  if (turnUrls.length > 0 && turnUsername && turnCredential) {
+    iceServers.push({
+      urls: turnUrls,
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return {
+    iceServers,
+  };
+}
+
+const RTC_CONFIGURATION = createRtcConfiguration();
+const ICE_SERVER_COUNT = RTC_CONFIGURATION.iceServers?.length ?? 0;
+const TURN_CONFIGURED = (RTC_CONFIGURATION.iceServers ?? []).some((server) => {
+  const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+  return urls.some((url) => url.startsWith("turn:") || url.startsWith("turns:"));
+});
 
 function getMatchStorageKey(session: RoomSession) {
   return `${ROOM_MATCH_STATE_PREFIX}:${session.roomCode}:${session.playerId}`;
@@ -77,6 +132,7 @@ async function requestRoomSync(session: RoomSession, instanceId: string) {
     status: response.status,
     room: payload?.room ?? null,
     signals: Array.isArray(payload?.signals) ? payload.signals : [],
+    messages: Array.isArray(payload?.messages) ? payload.messages : [],
     error: payload?.error ?? "방 상태를 불러오지 못했습니다.",
   };
 }
@@ -97,18 +153,30 @@ function buildLastMoveStyles(lastMove: MatchState["lastMove"]) {
   } satisfies Record<string, CSSProperties>;
 }
 
-function formatMoveNumber(index: number) {
-  return `${Math.floor(index / 2) + 1}.`;
-}
-
 function getPresenceState(player?: RoomPlayer) {
   if (!player) {
     return "빈 자리";
   }
 
-  return Date.now() - new Date(player.lastSeenAt).getTime() < 15_000
-    ? "온라인"
-    : "잠시 비움";
+  return isPlayerOnline(player) ? "온라인" : "잠시 비움";
+}
+
+function isPlayerOnline(player?: RoomPlayer) {
+  if (!player) {
+    return false;
+  }
+
+  return Date.now() - new Date(player.lastSeenAt).getTime() < 15_000;
+}
+
+function getPlayerMonogram(player?: RoomPlayer) {
+  const name = player?.name?.trim();
+
+  if (!name) {
+    return "--";
+  }
+
+  return name.slice(0, 2).toUpperCase();
 }
 
 function trimName(value: string) {
@@ -141,45 +209,6 @@ function chooseRemotePlayer(room: RoomSnapshot | null, playerId?: string) {
   }
 
   return room.players.find((entry) => entry.id !== playerId) ?? null;
-}
-
-function getRoomStatusMessage(
-  room: RoomSnapshot | null,
-  currentPlayer: RoomPlayer | null,
-  match: MatchState,
-  connectionStatus: ConnectionStatus,
-) {
-  if (!room) {
-    return "방을 만들거나 코드로 입장해보세요.";
-  }
-
-  if (room.players.length < 2) {
-    return "상대 플레이어 입장을 기다리는 중입니다.";
-  }
-
-  if (!currentPlayer) {
-    return "플레이어 정보를 확인하는 중입니다.";
-  }
-
-  if (connectionStatus === "negotiating") {
-    return "브라우저끼리 직접 연결을 만드는 중입니다.";
-  }
-
-  if (connectionStatus === "disconnected") {
-    return "연결이 끊겨 다시 협상하는 중입니다.";
-  }
-
-  if (connectionStatus !== "connected") {
-    return "상대 브라우저 연결을 기다리는 중입니다.";
-  }
-
-  if (match.result) {
-    return match.result.message;
-  }
-
-  return match.turn === currentPlayer.color
-    ? "당신 차례입니다."
-    : "상대 차례입니다.";
 }
 
 function serializeDescription(
@@ -222,48 +251,84 @@ export function RoomArena() {
   const [isHydrated, setIsHydrated] = useState(false);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("idle");
+  const [, setEventLog] = useState<RoomEventEntry[]>([]);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   const syncingRef = useRef(false);
   const copyResetTimerRef = useRef<number | null>(null);
   const disconnectRetryTimerRef = useRef<number | null>(null);
+  const signalFlushTimerRef = useRef<number | null>(null);
+  const signalFlushInFlightRef = useRef(false);
   const instanceIdRef = useRef("");
+  const sessionRef = useRef<RoomSession | null>(null);
   const roomRef = useRef<RoomSnapshot | null>(null);
   const matchRef = useRef(match);
   const connectionStatusRef = useRef<ConnectionStatus>("idle");
   const offeredForInstanceRef = useRef("");
   const activeConnectionIdRef = useRef("");
   const remoteInstanceRef = useRef("");
+  const fallbackSyncRef = useRef("");
   const processedSignalIdsRef = useRef<Set<string>>(new Set());
+  const processedRelayMessageIdsRef = useRef<Set<string>>(new Set());
   const pendingIceCandidatesRef = useRef<PendingCandidate[]>([]);
+  const outgoingSignalsRef = useRef<RoomClientSignal[]>([]);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
 
-  const deferredHistory = useDeferredValue(match.moveHistory);
   const currentPlayer =
     room?.players.find((entry) => entry.id === session?.playerId) ?? null;
+  const remotePlayer = chooseRemotePlayer(room, session?.playerId);
   const whitePlayer = room?.players.find((entry) => entry.color === "white");
   const blackPlayer = room?.players.find((entry) => entry.color === "black");
-  const statusMessage = getRoomStatusMessage(
-    room,
-    currentPlayer,
-    match,
-    connectionStatus,
-  );
+  const transportMode: TransportMode =
+    connectionStatus === "connected"
+      ? "webrtc"
+      : room && room.players.length === 2 && isPlayerOnline(remotePlayer ?? undefined)
+        ? "relay"
+        : "none";
+  const isCurrentPlayerTurn =
+    !!currentPlayer &&
+    !!room &&
+    transportMode !== "none" &&
+    match.status === "active" &&
+    !match.result &&
+    match.turn === currentPlayer.color;
   const boardOrientation = currentPlayer?.color ?? "white";
   const allowDragging =
     !!room &&
     !!currentPlayer &&
-    connectionStatus === "connected" &&
+    transportMode !== "none" &&
     match.status === "active" &&
     !match.result &&
     match.turn === currentPlayer.color;
 
   const ensureInstanceId = () => {
     if (!instanceIdRef.current) {
-      instanceIdRef.current = crypto.randomUUID();
+      const storedInstanceId = window.localStorage.getItem(ROOM_INSTANCE_ID_KEY);
+      const nextInstanceId = storedInstanceId?.trim() || crypto.randomUUID();
+      instanceIdRef.current = nextInstanceId;
+      window.localStorage.setItem(ROOM_INSTANCE_ID_KEY, nextInstanceId);
     }
 
     return instanceIdRef.current;
+  };
+
+  const appendEvent = (
+    label: string,
+    detail = "",
+    level: RoomEventEntry["level"] = "info",
+  ) => {
+    const entry: RoomEventEntry = {
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      label,
+      detail,
+      level,
+    };
+
+    startTransition(() => {
+      setEventLog((current) => [entry, ...current].slice(0, MAX_EVENT_LOGS));
+    });
   };
 
   const setLiveConnectionStatus = (nextStatus: ConnectionStatus) => {
@@ -331,69 +396,180 @@ export function RoomArena() {
     }
   };
 
-  const postSignal = useEffectEvent(
-    async (
-      signal:
-        | {
-            connectionId: string;
-            kind: "offer" | "answer";
-            targetId: string;
-            targetInstanceId?: string | null;
-            description: RTCSessionDescriptionInit;
-          }
-        | {
-            connectionId: string;
-            kind: "ice";
-            targetId: string;
-            targetInstanceId?: string | null;
-            candidate: RTCIceCandidateInit;
-          },
-    ) => {
-      if (!session) {
-        return false;
-      }
+  const postSignals = async (
+    signals: RoomClientSignal[],
+    source: "direct" | "queued" = "direct",
+  ) => {
+    const activeSession = sessionRef.current;
+    const remotePlayer = chooseRemotePlayer(
+      roomRef.current,
+      activeSession?.playerId,
+    );
 
-      try {
-        const response = await fetch(`/api/rooms/${session.roomCode}/signal`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            playerId: session.playerId,
-            targetId: signal.targetId,
-            connectionId: signal.connectionId,
-            targetInstanceId: signal.targetInstanceId ?? null,
-            kind: signal.kind,
-            description: "description" in signal ? signal.description : undefined,
-            candidate: "candidate" in signal ? signal.candidate : undefined,
-          }),
-        });
+    if (!activeSession || !remotePlayer || signals.length === 0) {
+      return false;
+    }
 
-        if (!response.ok) {
-          const payload = (await response.json().catch(() => null)) as
-            | {
-                error?: string;
-              }
-            | null;
+    try {
+      const response = await fetch(`/api/rooms/${activeSession.roomCode}/signal`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          playerId: activeSession.playerId,
+          targetId: remotePlayer.id,
+          targetInstanceId: remotePlayer.instanceId ?? null,
+          signals,
+        }),
+      });
 
-          startTransition(() => {
-            setErrorMessage(payload?.error ?? "연결 신호를 전달하지 못했습니다.");
-          });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              error?: string;
+            }
+          | null;
 
-          return false;
-        }
-
-        return true;
-      } catch {
         startTransition(() => {
-          setErrorMessage("연결 신호를 전달하지 못했습니다.");
+          setErrorMessage(payload?.error ?? "연결 신호를 전달하지 못했습니다.");
         });
+        appendEvent(
+          "Signal send failed",
+          `${source} / ${signals.map((signal) => signal.kind).join(", ")}`,
+          "error",
+        );
 
         return false;
       }
-    },
-  );
+
+      appendEvent(
+        "Signal sent",
+        `${source} / ${signals.length}개 / ${signals
+          .map((signal) => signal.kind)
+          .join(", ")}`,
+      );
+
+      return true;
+    } catch {
+      startTransition(() => {
+        setErrorMessage("연결 신호를 전달하지 못했습니다.");
+      });
+      appendEvent(
+        "Signal network error",
+        `${source} / ${signals.map((signal) => signal.kind).join(", ")}`,
+        "error",
+      );
+
+      return false;
+    }
+  };
+
+  const postRelayMessage = async (
+    message: PeerMessage,
+    source: "host-sync" | "guest-move" | "fallback-sync",
+  ) => {
+    const activeSession = sessionRef.current;
+    const remotePlayer = chooseRemotePlayer(
+      roomRef.current,
+      activeSession?.playerId,
+    );
+
+    if (!activeSession || !remotePlayer) {
+      return false;
+    }
+
+    try {
+      const response = await fetch(`/api/rooms/${activeSession.roomCode}/relay`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          playerId: activeSession.playerId,
+          targetId: remotePlayer.id,
+          targetInstanceId: remotePlayer.instanceId ?? null,
+          message,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              error?: string;
+            }
+          | null;
+
+        startTransition(() => {
+          setErrorMessage(payload?.error ?? "Vercel relay 전송에 실패했습니다.");
+        });
+        appendEvent("Relay send failed", source, "error");
+        return false;
+      }
+
+      appendEvent("Relay sent", `${source} / ${message.kind}`);
+      return true;
+    } catch {
+      startTransition(() => {
+        setErrorMessage("Vercel relay 전송에 실패했습니다.");
+      });
+      appendEvent("Relay network error", source, "error");
+      return false;
+    }
+  };
+
+  const flushQueuedSignals = async () => {
+    if (signalFlushInFlightRef.current || outgoingSignalsRef.current.length === 0) {
+      return;
+    }
+
+    signalFlushInFlightRef.current = true;
+    clearDisconnectRetryTimer();
+    const batch = [...outgoingSignalsRef.current];
+    outgoingSignalsRef.current = [];
+
+    const sent = await postSignals(batch, "queued");
+
+    if (!sent) {
+      outgoingSignalsRef.current = [...batch, ...outgoingSignalsRef.current].slice(
+        -MAX_OUTGOING_SIGNAL_BUFFER,
+      );
+    }
+
+    signalFlushInFlightRef.current = false;
+
+    if (outgoingSignalsRef.current.length > 0) {
+      void flushQueuedSignals();
+    }
+  };
+
+  const scheduleSignalFlush = (delay = SIGNAL_FLUSH_DELAY_MS) => {
+    if (signalFlushTimerRef.current) {
+      return;
+    }
+
+    signalFlushTimerRef.current = window.setTimeout(() => {
+      signalFlushTimerRef.current = null;
+      void flushQueuedSignals();
+    }, delay);
+  };
+
+  const queueSignals = (signals: RoomClientSignal[]) => {
+    if (signals.length === 0) {
+      return;
+    }
+
+    outgoingSignalsRef.current.push(...signals);
+
+    if (signals.some((signal) => signal.kind !== "ice")) {
+      appendEvent(
+        "Signal queued",
+        `${signals.length}개 / ${signals.map((signal) => signal.kind).join(", ")}`,
+      );
+    }
+
+    scheduleSignalFlush();
+  };
 
   const flushPendingIceCandidates = useEffectEvent(
     async (connectionId = activeConnectionIdRef.current) => {
@@ -431,8 +607,105 @@ export function RoomArena() {
     commitMatchState(normalizedMatch);
   });
 
+  const buildMatchFromMove = (
+    move: PeerMoveRequest,
+    actorColor: RoomPlayer["color"],
+  ) => {
+    const game = new Chess(matchRef.current.fen);
+
+    if (game.turn() !== toChessColor(actorColor)) {
+      return null;
+    }
+
+    try {
+      const appliedMove = game.move(move);
+
+      return {
+        san: appliedMove.san,
+        match: {
+          fen: game.fen(),
+          turn: toRoomColor(game.turn()),
+          moveHistory: [...matchRef.current.moveHistory, serializeMove(appliedMove)],
+          lastMove: {
+            from: appliedMove.from as Square,
+            to: appliedMove.to as Square,
+          },
+          result: getRoomResult(game),
+          status: game.isGameOver() ? "finished" : "active",
+          updatedAt: new Date().toISOString(),
+        } satisfies MatchState,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const sendGameMessage = async (
+    message: PeerMessage,
+    relaySource: "host-sync" | "guest-move" | "fallback-sync",
+  ) => {
+    if (sendPeerMessage(message)) {
+      appendEvent("Peer sent", `webrtc / ${message.kind}`);
+      return {
+        ok: true,
+        transport: "webrtc" as const,
+      };
+    }
+
+    const relayed = await postRelayMessage(message, relaySource);
+
+    return {
+      ok: relayed,
+      transport: relayed ? ("relay" as const) : ("none" as const),
+    };
+  };
+
+  const syncHostMatch = async (
+    nextMatch: MatchState,
+    reason: "host-sync" | "fallback-sync" = "host-sync",
+  ) => {
+    const currentRoom = roomRef.current;
+    const activeSession = sessionRef.current;
+    const localPlayer = currentRoom?.players.find(
+      (entry) => entry.id === activeSession?.playerId,
+    );
+
+    if (!currentRoom || !activeSession || localPlayer?.color !== "white") {
+      return false;
+    }
+
+    const result = await sendGameMessage(
+      {
+        kind: "match-sync",
+        match: withDerivedMatchStatus(nextMatch, currentRoom),
+        sentAt: new Date().toISOString(),
+      },
+      reason,
+    );
+
+    if (!result.ok) {
+      appendEvent("Host sync failed", reason, "error");
+      return false;
+    }
+
+    const nextRemotePlayer = chooseRemotePlayer(currentRoom, activeSession.playerId);
+
+    if (nextRemotePlayer?.instanceId) {
+      fallbackSyncRef.current = `${nextRemotePlayer.instanceId}:${nextMatch.updatedAt}`;
+    }
+
+    return true;
+  };
+
   const resetPeerConnection = (nextStatus: ConnectionStatus = "negotiating") => {
     clearDisconnectRetryTimer();
+    if (signalFlushTimerRef.current) {
+      window.clearTimeout(signalFlushTimerRef.current);
+      signalFlushTimerRef.current = null;
+    }
+
+    signalFlushInFlightRef.current = false;
+    outgoingSignalsRef.current = [];
     const channel = dataChannelRef.current;
 
     if (channel) {
@@ -464,6 +737,7 @@ export function RoomArena() {
     pendingIceCandidatesRef.current = [];
     offeredForInstanceRef.current = "";
     activeConnectionIdRef.current = "";
+    fallbackSyncRef.current = "";
 
     if (!roomRef.current || roomRef.current.players.length < 2) {
       setLiveConnectionStatus("waiting-peer");
@@ -474,6 +748,7 @@ export function RoomArena() {
   };
 
   const markDisconnected = () => {
+    appendEvent("Connection interrupted", "재협상 대기", "warn");
     setLiveConnectionStatus("disconnected");
 
     if (disconnectRetryTimerRef.current || !roomRef.current) {
@@ -495,43 +770,103 @@ export function RoomArena() {
     }, DISCONNECT_RECOVERY_MS);
   };
 
+  const handleTransportMessage = useEffectEvent(
+    async (
+      message: PeerMessage,
+      source: "webrtc" | "relay",
+      senderId?: string,
+    ) => {
+      const currentRoom = roomRef.current;
+      const activeSession = sessionRef.current;
+      const localPlayer = currentRoom?.players.find(
+        (entry) => entry.id === activeSession?.playerId,
+      );
+
+      if (!currentRoom || !activeSession || !localPlayer) {
+        return;
+      }
+
+      appendEvent("Peer message", `${source} / ${message.kind}`);
+
+      if (message.kind === "match-sync") {
+        if (localPlayer.color === "black") {
+          applyRemoteMatch(message.match);
+          startTransition(() => {
+            setErrorMessage("");
+          });
+        }
+
+        return;
+      }
+
+      if (localPlayer.color !== "white") {
+        return;
+      }
+
+      const remotePlayer = chooseRemotePlayer(currentRoom, activeSession.playerId);
+
+      if (!remotePlayer || (senderId && remotePlayer.id !== senderId)) {
+        return;
+      }
+
+      const moveResult = buildMatchFromMove(message.move, "black");
+
+      if (!moveResult) {
+        appendEvent(
+          "Guest move rejected",
+          `${message.move.from}-${message.move.to}`,
+          "warn",
+        );
+        await syncHostMatch(matchRef.current, "fallback-sync");
+        return;
+      }
+
+      commitMatchState(moveResult.match);
+      appendEvent(
+        "Guest move applied",
+        `${moveResult.san} / ${message.move.from}-${message.move.to}`,
+      );
+      await syncHostMatch(moveResult.match, "host-sync");
+    },
+  );
+
   const handlePeerMessage = useEffectEvent((event: MessageEvent<string>) => {
     const rawMessage = event.data;
 
     try {
       const message = JSON.parse(rawMessage) as PeerMessage;
 
-      if (!message || typeof message !== "object" || !message.match) {
+      if (!message || typeof message !== "object" || typeof message.kind !== "string") {
         return;
       }
 
-      applyRemoteMatch(message.match);
+      void handleTransportMessage(message, "webrtc");
     } catch {}
   });
 
   const attachDataChannel = useEffectEvent((channel: RTCDataChannel) => {
     dataChannelRef.current = channel;
+    appendEvent("Data channel", `${channel.label} attached`);
 
     channel.onopen = () => {
       clearDisconnectRetryTimer();
       setLiveConnectionStatus("connected");
       offeredForInstanceRef.current = remoteInstanceRef.current;
+      appendEvent("Data channel", `${channel.label} open`);
 
-      void sendPeerMessage({
-        kind: "sync",
-        match: withDerivedMatchStatus(matchRef.current, roomRef.current),
-        sentAt: new Date().toISOString(),
-      });
+      void syncHostMatch(matchRef.current, "host-sync");
     };
 
     channel.onmessage = handlePeerMessage;
 
     channel.onclose = () => {
       dataChannelRef.current = null;
+      appendEvent("Data channel", `${channel.label} close`, "warn");
       markDisconnected();
     };
 
     channel.onerror = () => {
+      appendEvent("Data channel", `${channel.label} error`, "error");
       markDisconnected();
     };
   });
@@ -554,19 +889,39 @@ export function RoomArena() {
           return;
         }
 
-        void postSignal({
-          connectionId,
-          kind: "ice",
-          targetId: remotePlayer.id,
-          targetInstanceId: remotePlayer.instanceId ?? null,
-          candidate: event.candidate.toJSON(),
-        });
+        queueSignals([
+          {
+            connectionId,
+            kind: "ice",
+            candidate: event.candidate.toJSON(),
+          },
+        ]);
+      };
+
+      peerConnection.onsignalingstatechange = () => {
+        appendEvent(
+          "Signaling state",
+          `${connectionId.slice(0, 8)} / ${peerConnection.signalingState}`,
+        );
+      };
+
+      peerConnection.onicegatheringstatechange = () => {
+        appendEvent(
+          "ICE gathering",
+          `${connectionId.slice(0, 8)} / ${peerConnection.iceGatheringState}`,
+        );
       };
 
       peerConnection.onconnectionstatechange = () => {
         if (peerConnectionRef.current !== peerConnection) {
           return;
         }
+
+        appendEvent(
+          "Peer connection",
+          `${connectionId.slice(0, 8)} / ${peerConnection.connectionState}`,
+          peerConnection.connectionState === "failed" ? "error" : "info",
+        );
 
         if (peerConnection.connectionState === "connected") {
           clearDisconnectRetryTimer();
@@ -597,6 +952,12 @@ export function RoomArena() {
         if (peerConnectionRef.current !== peerConnection) {
           return;
         }
+
+        appendEvent(
+          "ICE connection",
+          `${connectionId.slice(0, 8)} / ${peerConnection.iceConnectionState}`,
+          peerConnection.iceConnectionState === "failed" ? "error" : "info",
+        );
 
         if (peerConnection.iceConnectionState === "failed") {
           resetPeerConnection("disconnected");
@@ -671,6 +1032,10 @@ export function RoomArena() {
     const connectionId = crypto.randomUUID();
     activeConnectionIdRef.current = connectionId;
     remoteInstanceRef.current = remotePlayer.instanceId;
+    appendEvent(
+      "Offer start",
+      `${localPlayer.name} -> ${remotePlayer.name} / ${connectionId.slice(0, 8)}`,
+    );
 
     try {
       const peerConnection = createPeerConnection(remotePlayer, true, connectionId);
@@ -684,13 +1049,16 @@ export function RoomArena() {
         throw new Error("offer description unavailable");
       }
 
-      const sent = await postSignal({
-        connectionId,
-        kind: "offer",
-        targetId: remotePlayer.id,
-        targetInstanceId: remotePlayer.instanceId,
-        description,
-      });
+      const sent = await postSignals(
+        [
+          {
+            connectionId,
+            kind: "offer",
+            description,
+          },
+        ],
+        "direct",
+      );
 
       if (!sent) {
         resetPeerConnection("disconnected");
@@ -701,6 +1069,7 @@ export function RoomArena() {
       setLiveConnectionStatus("negotiating");
     } catch {
       resetPeerConnection("disconnected");
+      appendEvent("Offer failed", connectionId.slice(0, 8), "error");
       startTransition(() => {
         setErrorMessage("직접 연결을 시작하지 못했습니다.");
       });
@@ -726,8 +1095,14 @@ export function RoomArena() {
         const hadPeerConnection =
           !!peerConnectionRef.current || !!dataChannelRef.current;
         remoteInstanceRef.current = remotePlayer.instanceId;
+        fallbackSyncRef.current = "";
 
         if (hadPeerConnection) {
+          appendEvent(
+            "Remote instance changed",
+            remotePlayer.instanceId.slice(0, 8),
+            "warn",
+          );
           resetPeerConnection("negotiating");
         }
       }
@@ -746,6 +1121,7 @@ export function RoomArena() {
         }
 
         if (signal.kind === "offer") {
+          appendEvent("Signal received", `offer / ${signal.connectionId.slice(0, 8)}`);
           try {
             resetPeerConnection("negotiating");
             activeConnectionIdRef.current = signal.connectionId;
@@ -768,13 +1144,17 @@ export function RoomArena() {
               throw new Error("answer description unavailable");
             }
 
-            await postSignal({
-              connectionId: signal.connectionId,
-              kind: "answer",
-              targetId: signal.senderId,
-              targetInstanceId: signal.senderInstanceId,
-              description,
-            });
+            await postSignals(
+              [
+                {
+                  connectionId: signal.connectionId,
+                  kind: "answer",
+                  description,
+                },
+              ],
+              "direct",
+            );
+            appendEvent("Answer sent", signal.connectionId.slice(0, 8));
 
             setLiveConnectionStatus("negotiating");
           } catch {
@@ -785,6 +1165,7 @@ export function RoomArena() {
         }
 
         if (signal.kind === "answer") {
+          appendEvent("Signal received", `answer / ${signal.connectionId.slice(0, 8)}`);
           try {
             if (signal.connectionId !== activeConnectionIdRef.current) {
               continue;
@@ -807,6 +1188,7 @@ export function RoomArena() {
         }
 
         if (signal.kind === "ice") {
+          appendEvent("Signal received", `ice / ${signal.connectionId.slice(0, 8)}`);
           if (signal.connectionId !== activeConnectionIdRef.current) {
             pendingIceCandidatesRef.current.push({
               connectionId: signal.connectionId,
@@ -842,6 +1224,30 @@ export function RoomArena() {
     },
   );
 
+  const processRelayMessages = useEffectEvent(
+    async (messages: RoomRelayMessage[]) => {
+      for (const entry of messages) {
+        if (processedRelayMessageIdsRef.current.has(entry.id)) {
+          continue;
+        }
+
+        processedRelayMessageIdsRef.current.add(entry.id);
+
+        if (processedRelayMessageIdsRef.current.size > 200) {
+          processedRelayMessageIdsRef.current = new Set(
+            Array.from(processedRelayMessageIdsRef.current).slice(-120),
+          );
+        }
+
+        appendEvent(
+          "Relay received",
+          `${entry.message.kind} / ${entry.id.slice(0, 8)}`,
+        );
+        await handleTransportMessage(entry.message, "relay", entry.senderId);
+      }
+    },
+  );
+
   const syncRoom = useEffectEvent(async (force = false) => {
     if (!session) {
       return;
@@ -857,6 +1263,11 @@ export function RoomArena() {
       const snapshot = await requestRoomSync(session, ensureInstanceId());
 
       if (!snapshot.ok || !snapshot.room) {
+        appendEvent(
+          "Room sync failed",
+          `${snapshot.status} / ${snapshot.error}`,
+          "error",
+        );
         startTransition(() => {
           setErrorMessage(snapshot.error);
         });
@@ -878,6 +1289,13 @@ export function RoomArena() {
         setErrorMessage("");
       });
 
+      if (snapshot.signals.length > 0 || snapshot.messages.length > 0) {
+        appendEvent(
+          "Sync received",
+          `players ${snapshot.room.players.length} / signals ${snapshot.signals.length} / relay ${snapshot.messages.length}`,
+        );
+      }
+
       if (snapshot.room.players.length < 2) {
         if (connectionStatusRef.current !== "waiting-peer") {
           resetPeerConnection("waiting-peer");
@@ -895,7 +1313,26 @@ export function RoomArena() {
       }
 
       await processSignals(snapshot.room, snapshot.signals);
+      await processRelayMessages(snapshot.messages);
+
+      const localPlayer = snapshot.room.players.find(
+        (entry) => entry.id === session.playerId,
+      );
+      const nextRemotePlayer = chooseRemotePlayer(snapshot.room, session.playerId);
+
+      if (
+        localPlayer?.color === "white" &&
+        nextRemotePlayer?.instanceId &&
+        connectionStatusRef.current !== "connected"
+      ) {
+        const fallbackKey = `${nextRemotePlayer.instanceId}:${matchRef.current.updatedAt}`;
+
+        if (fallbackSyncRef.current !== fallbackKey) {
+          void syncHostMatch(matchRef.current, "fallback-sync");
+        }
+      }
     } catch {
+      appendEvent("Room sync error", "네트워크 또는 상태 조회 실패", "error");
       startTransition(() => {
         setErrorMessage("방 상태를 동기화하지 못했습니다.");
       });
@@ -906,7 +1343,12 @@ export function RoomArena() {
 
   useEffect(() => {
     setIsHydrated(true);
-    ensureInstanceId();
+    const instanceId = ensureInstanceId();
+    appendEvent(
+      "RTC config",
+      `${ICE_SERVER_COUNT} servers / TURN ${TURN_CONFIGURED ? "on" : "off"}`,
+    );
+    appendEvent("Client instance", instanceId.slice(0, 8));
 
     const storedPlayerName = window.localStorage.getItem(ROOM_PLAYER_NAME_KEY);
     const normalizedStoredPlayerName = trimName(storedPlayerName ?? "");
@@ -974,6 +1416,10 @@ export function RoomArena() {
   }, [isHydrated, session]);
 
   useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
     if (!isHydrated) {
       return;
     }
@@ -1019,6 +1465,14 @@ export function RoomArena() {
   }, [isHydrated, match, session]);
 
   useEffect(() => {
+    if (!session) {
+      return;
+    }
+
+    appendEvent("Session ready", `${session.roomCode} / ${session.playerId.slice(0, 8)}`);
+  }, [session]);
+
+  useEffect(() => {
     if (!isHydrated) {
       return;
     }
@@ -1034,6 +1488,46 @@ export function RoomArena() {
   }, [isHydrated, playerName]);
 
   useEffect(() => {
+    if (!session) {
+      return;
+    }
+
+    appendEvent("Heartbeat start", session.roomCode);
+
+    const postHeartbeat = async () => {
+      try {
+        const response = await fetch(`/api/rooms/${session.roomCode}/heartbeat`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            playerId: session.playerId,
+            instanceId: ensureInstanceId(),
+          }),
+        });
+
+        if (!response.ok) {
+          appendEvent("Heartbeat failed", session.roomCode, "warn");
+          return;
+        }
+      } catch {
+        appendEvent("Heartbeat network error", session.roomCode, "warn");
+      }
+    };
+
+    void postHeartbeat();
+
+    const intervalId = window.setInterval(() => {
+      void postHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [session]);
+
+  useEffect(() => {
     return () => {
       if (copyResetTimerRef.current) {
         window.clearTimeout(copyResetTimerRef.current);
@@ -1042,6 +1536,11 @@ export function RoomArena() {
       if (disconnectRetryTimerRef.current) {
         window.clearTimeout(disconnectRetryTimerRef.current);
         disconnectRetryTimerRef.current = null;
+      }
+
+      if (signalFlushTimerRef.current) {
+        window.clearTimeout(signalFlushTimerRef.current);
+        signalFlushTimerRef.current = null;
       }
 
       const channel = dataChannelRef.current;
@@ -1097,6 +1596,14 @@ export function RoomArena() {
     };
   }, [activePlayerId, activeRoomCode]);
 
+  useEffect(() => {
+    if (!activeRoomCode || !activePlayerId || retryNonce === 0) {
+      return;
+    }
+
+    void syncRoom(true);
+  }, [activePlayerId, activeRoomCode, retryNonce]);
+
   const createRoom = async () => {
     const nextPlayerName = trimName(playerName);
     const instanceId = ensureInstanceId();
@@ -1108,6 +1615,7 @@ export function RoomArena() {
 
     setBusyMode("create");
     setErrorMessage("");
+    appendEvent("Room create", nextPlayerName);
 
     try {
       const response = await fetch("/api/rooms", {
@@ -1138,13 +1646,16 @@ export function RoomArena() {
       }
 
       processedSignalIdsRef.current.clear();
+      processedRelayMessageIdsRef.current.clear();
       offeredForInstanceRef.current = "";
       remoteInstanceRef.current = "";
       activeConnectionIdRef.current = "";
+      fallbackSyncRef.current = "";
       pendingIceCandidatesRef.current = [];
       resetPeerConnection("waiting-peer");
       commitRoomSnapshot(nextRoom);
       setLiveConnectionStatus("waiting-peer");
+      appendEvent("Room created", nextRoom.code);
 
       startTransition(() => {
         setPlayerName(nextPlayerName);
@@ -1156,6 +1667,7 @@ export function RoomArena() {
         });
       });
     } catch {
+      appendEvent("Room create failed", nextPlayerName, "error");
       setErrorMessage("방을 만들지 못했습니다.");
     } finally {
       setBusyMode(null);
@@ -1179,6 +1691,7 @@ export function RoomArena() {
 
     setBusyMode("join");
     setErrorMessage("");
+    appendEvent("Room join", nextJoinCode);
 
     try {
       const response = await fetch(`/api/rooms/${nextJoinCode}/join`, {
@@ -1209,13 +1722,16 @@ export function RoomArena() {
       }
 
       processedSignalIdsRef.current.clear();
+      processedRelayMessageIdsRef.current.clear();
       offeredForInstanceRef.current = "";
       remoteInstanceRef.current = "";
       activeConnectionIdRef.current = "";
+      fallbackSyncRef.current = "";
       pendingIceCandidatesRef.current = [];
       resetPeerConnection("negotiating");
       commitRoomSnapshot(nextRoom);
       setLiveConnectionStatus("negotiating");
+      appendEvent("Room joined", nextRoom.code);
 
       startTransition(() => {
         setPlayerName(nextPlayerName);
@@ -1227,6 +1743,7 @@ export function RoomArena() {
         });
       });
     } catch {
+      appendEvent("Room join failed", nextJoinCode, "error");
       setErrorMessage("방에 입장하지 못했습니다.");
     } finally {
       setBusyMode(null);
@@ -1235,11 +1752,14 @@ export function RoomArena() {
 
   const leaveRoom = async () => {
     const activeSession = session;
+    appendEvent("Leave room", activeSession?.roomCode ?? "", "warn");
 
     processedSignalIdsRef.current.clear();
+    processedRelayMessageIdsRef.current.clear();
     remoteInstanceRef.current = "";
     offeredForInstanceRef.current = "";
     activeConnectionIdRef.current = "";
+    fallbackSyncRef.current = "";
     resetPeerConnection("idle");
     commitRoomSnapshot(null);
     setLiveConnectionStatus("idle");
@@ -1265,6 +1785,23 @@ export function RoomArena() {
     });
   };
 
+  const retryConnection = () => {
+    if (!session || !room || room.players.length < 2) {
+      return;
+    }
+
+    appendEvent("Retry connection", room.code, "warn");
+    processedSignalIdsRef.current.clear();
+    processedRelayMessageIdsRef.current.clear();
+    offeredForInstanceRef.current = "";
+    activeConnectionIdRef.current = "";
+    fallbackSyncRef.current = "";
+    pendingIceCandidatesRef.current = [];
+    outgoingSignalsRef.current = [];
+    resetPeerConnection("negotiating");
+    setRetryNonce((current) => current + 1);
+  };
+
   const copyInviteLink = async () => {
     if (!room) {
       return;
@@ -1274,6 +1811,7 @@ export function RoomArena() {
       const inviteUrl = new URL(room.invitePath, window.location.origin);
       await navigator.clipboard.writeText(inviteUrl.toString());
       setCopied(true);
+      appendEvent("Invite copied", inviteUrl.toString());
 
       if (copyResetTimerRef.current) {
         window.clearTimeout(copyResetTimerRef.current);
@@ -1294,53 +1832,66 @@ export function RoomArena() {
     sourceSquare: string;
     targetSquare: string | null;
   }) => {
-    if (!room || !session || !currentPlayer || !targetSquare || !allowDragging) {
+    if (
+      !room ||
+      !session ||
+      !currentPlayer ||
+      !remotePlayer ||
+      !targetSquare ||
+      !allowDragging
+    ) {
       return false;
     }
 
-    const nextGame = new Chess(match.fen);
+    const move: PeerMoveRequest = {
+      from: sourceSquare as Square,
+      to: targetSquare as Square,
+      promotion: "q",
+    };
 
-    if (nextGame.turn() !== toChessColor(currentPlayer.color)) {
-      return false;
-    }
+    if (currentPlayer.color === "white") {
+      const moveResult = buildMatchFromMove(move, "white");
 
-    try {
-      const appliedMove = nextGame.move({
-        from: sourceSquare,
-        to: targetSquare,
-        promotion: "q",
-      });
-
-      const nextMatch: MatchState = {
-        fen: nextGame.fen(),
-        turn: toRoomColor(nextGame.turn()),
-        moveHistory: [...match.moveHistory, serializeMove(appliedMove)],
-        lastMove: {
-          from: appliedMove.from as Square,
-          to: appliedMove.to as Square,
-        },
-        result: getRoomResult(nextGame),
-        status: nextGame.isGameOver() ? "finished" : "active",
-        updatedAt: new Date().toISOString(),
-      };
-
-      const sent = sendPeerMessage({
-        kind: "move",
-        match: nextMatch,
-        sentAt: nextMatch.updatedAt,
-      });
-
-      if (!sent) {
-        setErrorMessage("상대 브라우저와 연결되지 않아 수를 보낼 수 없습니다.");
+      if (!moveResult) {
         return false;
       }
 
-      commitMatchState(nextMatch);
+      commitMatchState(moveResult.match);
+      appendEvent(
+        "Host move applied",
+        `${moveResult.san} / ${sourceSquare}-${targetSquare}`,
+      );
       setErrorMessage("");
+      void syncHostMatch(moveResult.match, "host-sync");
       return true;
-    } catch {
-      return false;
     }
+
+    void sendGameMessage(
+      {
+        kind: "move-request",
+        move,
+        sentAt: new Date().toISOString(),
+      },
+      "guest-move",
+    ).then((result) => {
+      if (!result.ok) {
+        appendEvent("Guest move failed", `${sourceSquare}-${targetSquare}`, "error");
+        startTransition(() => {
+          setErrorMessage("호스트에게 수 요청을 전달하지 못했습니다.");
+        });
+        return;
+      }
+
+      appendEvent(
+        "Guest move requested",
+        `${sourceSquare}-${targetSquare} / ${result.transport}`,
+      );
+      startTransition(() => {
+        setErrorMessage("호스트가 수를 검증 중입니다.");
+      });
+    });
+
+    return false;
   };
 
   return (
@@ -1355,48 +1906,10 @@ export function RoomArena() {
               코드로 친구와 바로 대국하기
             </h2>
           </div>
-
-          <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/8 px-3 py-2 text-sm text-stone-100">
-            <span
-              className={`h-2.5 w-2.5 rounded-full ${
-                connectionStatus === "connected"
-                  ? "bg-emerald-300"
-                  : "bg-amber-300"
-              }`}
-            />
-            {statusMessage}
-          </div>
         </div>
 
         {session && room ? (
           <>
-            <div className="mb-4 grid gap-3 sm:grid-cols-[1fr_auto_auto]">
-              <div className="rounded-3xl border border-white/10 bg-black/14 p-4">
-                <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
-                  Room Code
-                </p>
-                <p className="mt-2 font-[family:var(--font-mono)] text-3xl text-stone-50">
-                  {room.code}
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => void copyInviteLink()}
-                className="rounded-3xl border border-emerald-300/25 bg-emerald-300/12 px-5 py-4 text-sm text-emerald-50 transition hover:bg-emerald-300/18"
-              >
-                {copied ? "링크 복사됨" : "초대 링크 복사"}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => void leaveRoom()}
-                className="rounded-3xl border border-white/12 bg-white/6 px-5 py-4 text-sm text-stone-200 transition hover:bg-white/10"
-              >
-                세션 나가기
-              </button>
-            </div>
-
             <div className="mx-auto w-full max-w-[640px] rounded-[28px] border border-white/10 bg-black/18 p-3 shadow-[0_24px_60px_rgba(0,0,0,0.25)] sm:p-4">
               <Chessboard
                 options={{
@@ -1502,12 +2015,6 @@ export function RoomArena() {
           </div>
         ) : null}
 
-        <p className="mt-4 text-sm leading-6 text-stone-300/82">
-          현재 방 대전은 브라우저끼리 직접 연결하는 WebRTC DataChannel 기반입니다.
-          Vercel은 방 생성과 offer/answer/ICE 교환용 signaling만 맡고, 실제
-          수순은 두 클라이언트가 직접 주고받습니다. 일부 제한적인 네트워크에서는
-          TURN 서버가 없으면 연결이 어려울 수 있습니다.
-        </p>
       </div>
 
       <div className="grid gap-6">
@@ -1529,98 +2036,170 @@ export function RoomArena() {
             </div>
           </div>
 
+          {session && room ? (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-[28px] border border-white/10 bg-black/14 p-4 sm:col-span-2">
+                <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
+                  Room Code
+                </p>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <p className="font-[family:var(--font-mono)] text-3xl text-stone-50">
+                    {room.code}
+                  </p>
+                  <div className="rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs uppercase tracking-[0.24em] text-stone-300">
+                    Match Controls
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void copyInviteLink()}
+                className="rounded-[24px] border border-emerald-300/25 bg-emerald-300/12 px-4 py-4 text-sm text-emerald-50 transition hover:bg-emerald-300/18"
+              >
+                {copied ? "링크 복사됨" : "초대 링크 복사"}
+              </button>
+
+              <button
+                type="button"
+                onClick={retryConnection}
+                className="rounded-[24px] border border-amber-300/20 bg-amber-300/10 px-4 py-4 text-sm text-amber-50 transition hover:bg-amber-300/18"
+              >
+                연결 다시 시도
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void leaveRoom()}
+                className="rounded-[24px] border border-white/12 bg-white/6 px-4 py-4 text-sm text-stone-200 transition hover:bg-white/10 sm:col-span-2"
+              >
+                세션 나가기
+              </button>
+            </div>
+          ) : null}
+
           <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-3xl border border-white/10 bg-black/14 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
-                White
-              </p>
-              <p className="mt-2 text-lg text-stone-50">
-                {whitePlayer?.name ?? "대기 중"}
-              </p>
-              <p className="mt-1 text-sm text-stone-300/80">
-                {getPresenceState(whitePlayer)}
-              </p>
+            <div className="rounded-[30px] border border-amber-200/28 bg-[linear-gradient(160deg,rgba(255,245,222,0.2),rgba(255,212,134,0.08))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]">
+              <div className="flex items-start justify-between gap-3">
+                <div className="inline-flex items-center gap-2 rounded-full border border-amber-100/35 bg-amber-50/16 px-3 py-1 text-[11px] uppercase tracking-[0.28em] text-amber-50">
+                  <span className="h-2.5 w-2.5 rounded-full bg-amber-100" />
+                  White
+                </div>
+                {currentPlayer?.id === whitePlayer?.id ? (
+                  <div className="rounded-full border border-emerald-200/30 bg-emerald-300/14 px-3 py-1 text-[11px] uppercase tracking-[0.24em] text-emerald-50">
+                    You
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="mt-4 flex items-center gap-4">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-white/30 bg-white/75 font-[family:var(--font-display)] text-2xl text-slate-900 shadow-[0_10px_30px_rgba(255,244,214,0.18)]">
+                  {getPlayerMonogram(whitePlayer)}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] uppercase tracking-[0.28em] text-amber-50/72">
+                    Host Seat
+                  </p>
+                  <p className="mt-1 truncate font-[family:var(--font-display)] text-3xl leading-none text-white">
+                    {whitePlayer?.name ?? "대기 중"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <div className="rounded-full border border-white/18 bg-black/20 px-3 py-1 text-xs text-stone-100">
+                  {getPresenceState(whitePlayer)}
+                </div>
+                <div className="rounded-full border border-white/14 bg-white/10 px-3 py-1 text-xs text-stone-200">
+                  {whitePlayer ? "백 진영" : "플레이어 대기"}
+                </div>
+              </div>
             </div>
-            <div className="rounded-3xl border border-white/10 bg-black/14 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
-                Black
-              </p>
-              <p className="mt-2 text-lg text-stone-50">
-                {blackPlayer?.name ?? "대기 중"}
-              </p>
-              <p className="mt-1 text-sm text-stone-300/80">
-                {getPresenceState(blackPlayer)}
-              </p>
+
+            <div className="rounded-[30px] border border-emerald-300/20 bg-[linear-gradient(160deg,rgba(36,98,87,0.45),rgba(7,18,25,0.45))] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+              <div className="flex items-start justify-between gap-3">
+                <div className="inline-flex items-center gap-2 rounded-full border border-emerald-300/24 bg-emerald-300/12 px-3 py-1 text-[11px] uppercase tracking-[0.28em] text-emerald-50">
+                  <span className="h-2.5 w-2.5 rounded-full bg-slate-950 ring-1 ring-white/25" />
+                  Black
+                </div>
+                {currentPlayer?.id === blackPlayer?.id ? (
+                  <div className="rounded-full border border-emerald-200/30 bg-emerald-300/14 px-3 py-1 text-[11px] uppercase tracking-[0.24em] text-emerald-50">
+                    You
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="mt-4 flex items-center gap-4">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-white/12 bg-slate-950/86 font-[family:var(--font-display)] text-2xl text-stone-50 shadow-[0_10px_30px_rgba(0,0,0,0.18)]">
+                  {getPlayerMonogram(blackPlayer)}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] uppercase tracking-[0.28em] text-emerald-100/62">
+                    Guest Seat
+                  </p>
+                  <p className="mt-1 truncate font-[family:var(--font-display)] text-3xl leading-none text-stone-50">
+                    {blackPlayer?.name ?? "대기 중"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <div className="rounded-full border border-white/12 bg-black/24 px-3 py-1 text-xs text-stone-100">
+                  {getPresenceState(blackPlayer)}
+                </div>
+                <div className="rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-stone-200">
+                  {blackPlayer ? "흑 진영" : "플레이어 대기"}
+                </div>
+              </div>
             </div>
-            <div className="rounded-3xl border border-white/10 bg-black/14 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
-                You
-              </p>
-              <p className="mt-2 text-lg text-stone-50">
-                {currentPlayer
-                  ? `${currentPlayer.name} (${sideLabel(currentPlayer.color)})`
-                  : "미참가"}
-              </p>
-            </div>
-            <div className="rounded-3xl border border-white/10 bg-black/14 p-4">
+            <div
+              className={`rounded-3xl p-4 transition ${
+                isCurrentPlayerTurn
+                  ? "border border-emerald-300/40 bg-[radial-gradient(circle_at_top_left,rgba(109,255,205,0.18),transparent_46%),linear-gradient(180deg,rgba(44,95,78,0.5),rgba(13,32,28,0.82))] shadow-[0_0_0_1px_rgba(132,255,213,0.05),0_0_34px_rgba(74,222,128,0.2),inset_0_1px_0_rgba(255,255,255,0.1)] sm:col-span-2"
+                  : "border border-white/10 bg-black/14 sm:col-span-2"
+              }`}
+            >
               <p className="text-xs uppercase tracking-[0.28em] text-stone-300/65">
                 Turn
               </p>
-              <p className="mt-2 text-lg text-stone-50">
-                {room ? `${sideLabel(match.turn)} 차례` : "대기 중"}
-              </p>
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-lg text-stone-50">
+                    {room ? `${sideLabel(match.turn)} 차례` : "대기 중"}
+                  </p>
+                  <p
+                    className={`mt-1 text-sm ${
+                      isCurrentPlayerTurn ? "text-emerald-100" : "text-stone-300/75"
+                    }`}
+                  >
+                    {isCurrentPlayerTurn
+                      ? "지금 수를 둘 수 있습니다."
+                      : room
+                        ? "상대 차례에는 강조가 꺼집니다."
+                        : "플레이어 입장을 기다리는 중입니다."}
+                  </p>
+                </div>
+                <div
+                  className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs uppercase tracking-[0.24em] ${
+                    isCurrentPlayerTurn
+                      ? "border border-emerald-200/30 bg-emerald-300/16 text-emerald-50"
+                      : "border border-white/10 bg-white/6 text-stone-300"
+                  }`}
+                >
+                  <span
+                    className={`h-2.5 w-2.5 rounded-full ${
+                      isCurrentPlayerTurn
+                        ? "bg-emerald-300 shadow-[0_0_16px_rgba(74,222,128,0.95)]"
+                        : "bg-stone-500"
+                    }`}
+                  />
+                  {isCurrentPlayerTurn ? "내 차례" : "대기 중"}
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        <div className="glass-panel p-5">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs uppercase tracking-[0.3em] text-stone-300/65">
-                Move List
-              </p>
-              <h3 className="mt-2 font-[family:var(--font-display)] text-2xl text-stone-50">
-                Shared Game Score
-              </h3>
-            </div>
-            <div className="rounded-full border border-white/10 bg-white/8 px-3 py-2 font-[family:var(--font-mono)] text-sm text-stone-200">
-              {deferredHistory.length} half-moves
-            </div>
-          </div>
-
-          <div className="mt-4 max-h-[360px] overflow-y-auto rounded-[24px] border border-white/10 bg-black/14 p-3">
-            {deferredHistory.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center text-sm leading-6 text-stone-300/72">
-                직접 연결이 완료되면 여기부터 공동 기보가 쌓입니다.
-              </div>
-            ) : (
-              <div className="grid gap-2">
-                {Array.from(
-                  { length: Math.ceil(deferredHistory.length / 2) },
-                  (_, index) => {
-                    const whiteMove = deferredHistory[index * 2];
-                    const blackMove = deferredHistory[index * 2 + 1];
-
-                    return (
-                      <div
-                        key={`${index}-${whiteMove?.san ?? "opening"}`}
-                        className="grid grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)] items-center gap-3 rounded-2xl border border-white/6 bg-white/5 px-3 py-2 text-sm text-stone-100"
-                      >
-                        <span className="font-[family:var(--font-mono)] text-stone-400">
-                          {formatMoveNumber(index * 2)}
-                        </span>
-                        <span className="truncate">{whiteMove?.san ?? "..."}</span>
-                        <span className="truncate text-stone-300">
-                          {blackMove?.san ?? ""}
-                        </span>
-                      </div>
-                    );
-                  },
-                )}
-              </div>
-            )}
-          </div>
-        </div>
       </div>
     </section>
   );
